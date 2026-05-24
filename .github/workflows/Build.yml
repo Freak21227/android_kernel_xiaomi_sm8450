@@ -3,7 +3,7 @@ env:
   TZ: Asia/Shanghai
   ANDROID_VERSION: 'android12'
   KERNEL_VERSION: '5.10'
-  KERNEL_NAME: 'Xinran_MI-Dev'
+  KERNEL_NAME: 'New'
 on:
   workflow_dispatch:
     inputs:
@@ -64,9 +64,8 @@ jobs:
       - name: 初始化源码仓库
         run: |
           rm -rf kernel_workspace && mkdir kernel_workspace && cd kernel_workspace
-          git clone --depth=1 https://github.com/Freak21227/android_kernel_xiaomi_sm8450 -b main
-          rm common/android/abi_gki_protected_exports_* || true
-      
+          git clone --depth=1 https://github.com/Freak21227/android_kernel_xiaomi_sm8450 
+          
       - name: 添加 KernelSU
         id: ksu_version
         run: |
@@ -79,7 +78,7 @@ jobs:
           cd kernel_workspace
           cd common
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
-            for f in ./arch/arm64/configs/xiaomi_diting_defconfig; do
+            for f in ./arch/arm64/configs/mondrian_defconfig; do
               sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${{ github.event.inputs.kernel_suffix }}\"/" "$f"
             done
           fi
