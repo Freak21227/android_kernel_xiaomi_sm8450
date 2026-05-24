@@ -1,39 +1,71 @@
 name: Build Kernel
+
 env:
-  TZ: Asia/Shanghai
-  ANDROID_VERSION: 'android12'
-  KERNEL_VERSION: '5.10'
-  KERNEL_NAME: 'New'
+  TZ: Asia/Istanbul
+  ANDROID_VERSION: "android12"
+  KERNEL_VERSION: "5.10"
+  CLANG_VERSION: "20.1.0"
+  ANYKERNEL_REPO: "https://github.com/Winkmoon/AnyKernel3"
+  KERNEL_REPO: "https://github.com/Freak21227/android_kernel_xiaomi_sm8450"
+  DEFCONFIG: "mondrian_defconfig"
+
 on:
   workflow_dispatch:
     inputs:
       kernel_suffix:
-        description: '内核后缀(留空默认,开头别加连字符)'
+        description: "Kernel suffix (leave empty for default, do not add a hyphen at the start)"
         required: false
         type: string
+      enable_lto:
+        description: "Enable LTO (Link Time Optimization)"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      upload_release:
+        description: "Create a GitHub Release after build"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
 jobs:
   build:
+    name: "Build Kernel"
     runs-on: ubuntu-latest
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
+      build_status: ${{ steps.build_kernel.outputs.build_status }}
+
     steps:
-      - name: 最大化建筑空间
+      # ──────────────────────────────────────────────
+      # 1. Maximize disk space
+      # ──────────────────────────────────────────────
+      - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 8192
           temp-reserve-mb: 2048
           swap-size-mb: 8192
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-      
-      - name: 安装配置环境依赖
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+
+      # ──────────────────────────────────────────────
+      # 2. Install dependencies
+      # ──────────────────────────────────────────────
+      - name: Install build dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y \
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
             build-essential \
-            flex bison \
+            flex \
+            bison \
             dwarves \
             libssl-dev \
             libelf-dev \
@@ -53,84 +85,235 @@ jobs:
             binutils-aarch64-linux-gnu \
             binutils-arm-linux-gnueabihf \
             neofetch
+
+          echo "::group::System info"
           lscpu
           neofetch
-          wget -O LLVM-20.1.0-Linux-X64.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.0/LLVM-20.1.0-Linux-X64.tar.xz
-          tar -xvaf LLVM-20.1.0-Linux-X64.tar.xz
-          mv LLVM-20.1.0-Linux-X64 aosp-clang
-          rm LLVM-20.1.0-Linux-X64.tar.xz
-          echo "AOSP_CLANG_PATH=$(pwd)/aosp-clang" >> $GITHUB_ENV
-          echo "PATH=$(pwd)/aosp-clang/bin:$PATH" >> $GITHUB_ENV
-      - name: 初始化源码仓库
+          echo "::endgroup::"
+          df -h
+
+      # ──────────────────────────────────────────────
+      # 3. Set up LLVM/Clang toolchain
+      # ──────────────────────────────────────────────
+      - name: Set up LLVM ${{ env.CLANG_VERSION }} toolchain
         run: |
-          rm -rf kernel_workspace && mkdir kernel_workspace && cd kernel_workspace
-          git clone --depth=1 https://github.com/Freak21227/android_kernel_xiaomi_sm8450 
-          
-      - name: 添加 KernelSU
+          LLVM_ARCHIVE="LLVM-${CLANG_VERSION}-Linux-X64.tar.xz"
+          LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/${LLVM_ARCHIVE}"
+
+          echo "Downloading LLVM toolchain..."
+          wget --progress=dot:giga -O "$LLVM_ARCHIVE" "$LLVM_URL"
+
+          echo "Extracting toolchain..."
+          tar -xf "$LLVM_ARCHIVE"
+          mv "LLVM-${CLANG_VERSION}-Linux-X64" aosp-clang
+          rm -f "$LLVM_ARCHIVE"
+
+          CLANG_BIN="$(pwd)/aosp-clang/bin"
+          echo "AOSP_CLANG_PATH=$(pwd)/aosp-clang" >> "$GITHUB_ENV"
+          echo "PATH=${CLANG_BIN}:${PATH}"         >> "$GITHUB_ENV"
+
+          echo "Clang version:"
+          "${CLANG_BIN}/clang" --version
+
+      # ──────────────────────────────────────────────
+      # 4. Clone kernel source
+      #
+      # The repo root already contains drivers/, arch/,
+      # Makefile etc. — this is NOT a GKI multi-repo
+      # layout. We clone it as "kernel_src" so that
+      # KernelSU setup.sh finds $GKI_ROOT/drivers.
+      # ──────────────────────────────────────────────
+      - name: Clone kernel source
+        run: |
+          echo "Cloning kernel repository..."
+          git clone --depth=1 "$KERNEL_REPO" kernel_src
+          echo "Kernel source HEAD:"
+          git -C kernel_src log --oneline -5
+          echo "Verify kernel root layout:"
+          ls kernel_src/ | head -20
+
+      # ──────────────────────────────────────────────
+      # 5. Set up KernelSU
+      #
+      # setup.sh uses $(pwd) as GKI_ROOT and checks for:
+      #   $GKI_ROOT/common/drivers   (GKI multi-repo)
+      #   $GKI_ROOT/drivers          (single-repo, ours)
+      #
+      # So we must run setup.sh from inside kernel_src/
+      # ──────────────────────────────────────────────
+      - name: Set up KernelSU
         id: ksu_version
         run: |
-          cd kernel_workspace
+          cd kernel_src
+          echo "Installing KernelSU (running from: $(pwd))..."
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
 
-      
-      - name: 添加制作名称
+          # Capture KernelSU version
+          KSU_VER=$(cat drivers/kernelsu/version 2>/dev/null || echo "unknown")
+          echo "KernelSU version: $KSU_VER"
+          echo "ksuver=$KSU_VER" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────
+      # 6. Apply kernel suffix (CONFIG_LOCALVERSION)
+      # ──────────────────────────────────────────────
+      - name: Apply kernel suffix
         run: |
-          cd kernel_workspace
-          cd common
-          if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
-            for f in ./arch/arm64/configs/mondrian_defconfig; do
-              sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${{ github.event.inputs.kernel_suffix }}\"/" "$f"
-            done
+          SUFFIX="${{ github.event.inputs.kernel_suffix }}"
+          DEFCONFIG_PATH="kernel_src/arch/arm64/configs/${{ env.DEFCONFIG }}"
+
+          if [[ ! -f "$DEFCONFIG_PATH" ]]; then
+            echo "::error::Defconfig not found at $DEFCONFIG_PATH"
+            ls kernel_src/arch/arm64/configs/ | grep -i mondrian || true
+            exit 1
           fi
-      
-      - name: 构建内核
-        continue-on-error: true
+
+          if [[ -n "$SUFFIX" ]]; then
+            echo "Applying kernel suffix: -${SUFFIX}"
+            sed -i "s/^CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"-${SUFFIX}\"/" "$DEFCONFIG_PATH"
+          else
+            echo "No kernel suffix specified, keeping default."
+          fi
+
+          grep "CONFIG_LOCALVERSION" "$DEFCONFIG_PATH" || true
+
+      # ──────────────────────────────────────────────
+      # 7. Build kernel
+      # ──────────────────────────────────────────────
+      - name: Build kernel
+        id: build_kernel
         run: |
-          cd kernel_workspace/common
+          cd kernel_src
+
           export ARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
-          export PATH=$AOSP_CLANG_PATH/bin:$PATH
+          export PATH="${AOSP_CLANG_PATH}/bin:${PATH}"
           export LLVM=1
-          export LLVM_IAS=0
+          export LLVM_IAS=1
           export KCFLAGS="-Wno-error -Wno-deprecated-declarations"
           export KBUILD_BUILD_VERSION="0"
           export SOURCE_DATE_EPOCH=$(date +%s)
-          export KBUILD_BUILD_USER=XinRan♡
-          export KBUILD_BUILD_HOST=Bai
-          make LLVM=1 LLVM_IAS=1 ARCH=arm64 CC="clang" BUILD_CONFIG=build.config.gki.aarch64 O=out DEPMOD=depmod xiaomi_diting_defconfig
-          scripts/config --file out/.config -e LTO_CLANG -d LTO_NONE -e LTO_CLANG_THIN -d LTO_CLANG_FULL -e THINLTO
-          make -j24 O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1
-      
-      - name: 克隆 AnyKernel3 并打包
+          export KBUILD_BUILD_USER="XinRan"
+          export KBUILD_BUILD_HOST="Bai"
+
+          JOBS=$(nproc --all)
+          echo "Using $JOBS parallel jobs"
+
+          # ── Generate .config ──
+          echo "::group::make defconfig"
+          make O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ${{ env.DEFCONFIG }}
+          echo "::endgroup::"
+
+          # ── Optional LTO tweaks ──
+          if [[ "${{ github.event.inputs.enable_lto }}" == "true" ]]; then
+            echo "Enabling ThinLTO..."
+            scripts/config --file out/.config \
+              -e LTO_CLANG \
+              -d LTO_NONE \
+              -e LTO_CLANG_THIN \
+              -d LTO_CLANG_FULL \
+              -e THINLTO
+          fi
+
+          # ── Compile ──
+          echo "::group::make"
+          if make -j"$JOBS" O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1; then
+            echo "build_status=success" >> "$GITHUB_OUTPUT"
+            echo "✅ Kernel build succeeded."
+          else
+            echo "build_status=failure" >> "$GITHUB_OUTPUT"
+            echo "❌ Kernel build failed."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "Output image:"
+          ls -lh out/arch/arm64/boot/Image || echo "Image not found!"
+
+      # ──────────────────────────────────────────────
+      # 8. Package with AnyKernel3
+      # ──────────────────────────────────────────────
+      - name: Package with AnyKernel3
         run: |
-          cd kernel_workspace
-          cd common
-          git clone https://github.com/Winkmoon/AnyKernel3 --depth=1
-          rm -rf ./AnyKernel3/.git
+          cd kernel_src
+
+          echo "Cloning AnyKernel3..."
+          git clone --depth=1 "$ANYKERNEL_REPO" AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          TIMESTAMP=$(date +%Y%m%d-%H%M)
+          SUFFIX="${{ github.event.inputs.kernel_suffix }}"
+          ZIP_NAME="Kernel_SM8450_${TIMESTAMP}${SUFFIX:+-${SUFFIX}}.zip"
+
           cd AnyKernel3
-          cp ../out/arch/arm64/boot/Image ./Image
-          zip -r ../AnyKernel3_xiaomi_diting.zip ./*
-      
-      - name: 上传 ZIP 工件
+          zip -r9 "../${ZIP_NAME}" ./*
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+          echo "Created: ${ZIP_NAME} ($(du -sh ${ZIP_NAME} | cut -f1))"
+          ls -lh ./*.zip
+
+      # ──────────────────────────────────────────────
+      # 9. Upload build artifact
+      # ──────────────────────────────────────────────
+      - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
         with:
           name: Kernel_ZIP_Artifacts
-          path: ${{ github.workspace }}/kernel_workspace/common/*.zip
+          path: ${{ github.workspace }}/kernel_src/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
+  # ────────────────────────────────────────────────
+  # Release job
+  # ────────────────────────────────────────────────
   release:
+    name: "Create GitHub Release"
     needs: build
+    if: ${{ github.event.inputs.upload_release == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
       actions: read
-      
+
     steps:
-      - name: 下载 ZIP 工件
+      - name: Download ZIP artifact
         uses: actions/download-artifact@v4
         with:
           name: Kernel_ZIP_Artifacts
           path: ./release_zips
-      
+
+      - name: List release files
+        run: ls -lh ./release_zips/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "kernel-${{ github.run_number }}-${{ github.run_attempt }}"
+          name: "Kernel Build #${{ github.run_number }}"
+          body: |
+            ## Kernel Build Info
+            - **Device:** Xiaomi SM8450 (Mondrian)
+            - **Android version:** ${{ env.ANDROID_VERSION }}
+            - **Kernel version:** ${{ env.KERNEL_VERSION }}
+            - **KernelSU version:** ${{ needs.build.outputs.ksuver }}
+            - **Kernel suffix:** `${{ github.event.inputs.kernel_suffix || '(default)' }}`
+            - **LTO enabled:** ${{ github.event.inputs.enable_lto }}
+            - **Workflow run:** [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          files: ./release_zips/*.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          
